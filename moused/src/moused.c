@@ -1,6 +1,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/input.h>
+#include <linux/input-event-codes.h>
 #include <linux/uinput.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -63,10 +64,15 @@ int new_device() {
     // Clone the enabled event types and codes of the device
     clone_enabled_event_types_and_codes(input, fd);
 
+    // Set device properties to match physical trackpad (PROP=5)
+    // This tells libinput it's a buttonpad-style touchpad, enabling proper gesture support
+    ioctl(fd, UI_SET_PROPBIT, INPUT_PROP_POINTER);     // 0x00
+    ioctl(fd, UI_SET_PROPBIT, INPUT_PROP_BUTTONPAD);   // 0x02
+
     // Setup the device
     struct uinput_setup uisetup = {0};
     memset(&uisetup, 0, sizeof(uisetup));
-    strcpy(uisetup.name, "MiniBookSupport Virtual Mouse");
+    strcpy(uisetup.name, "MiniBookSupport Virtual Touchpad");
     uisetup.id.bustype = BUS_USB;
     uisetup.id.vendor = 0x1234;
     uisetup.id.product = 0x5678;
