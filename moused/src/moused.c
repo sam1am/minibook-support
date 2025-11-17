@@ -31,6 +31,14 @@ int input = -1, output = -1;
 int is_enabled_passthrough = 1;
 int is_enabled_calibration = 0;
 
+// Position filtering to reduce jitter and lift noise
+int last_abs_x = -1;
+int last_abs_y = -1;
+int prev_delta_x = 0;
+int prev_delta_y = 0;
+#define JITTER_THRESHOLD 3      // Ignore movements smaller than this (pixels)
+#define JUMP_THRESHOLD 50       // Suppress jumps larger than this (likely lift noise)
+
 // Recovery the device
 void recovery_device() {
     // Enable the pointer
@@ -287,6 +295,14 @@ int main(int argc, char *argv[]) {
                     press_key(event.code);
                 } else if (event.value == 0) {
                     release_key(event.code);
+                    // Reset position tracking when finger lifts
+                    if (event.code == BTN_TOUCH) {
+                        last_abs_x = -1;
+                        last_abs_y = -1;
+                        prev_delta_x = 0;
+                        prev_delta_y = 0;
+                        debug_printf("Reset position tracking (finger lifted)\n");
+                    }
                 }
                 emit(output, event.type, event.code, event.value);
             }
@@ -331,6 +347,34 @@ int main(int argc, char *argv[]) {
         case EV_ABS:
             debug_printf("EV_ABS: %d %d\n", event.code, event.value);
             if (is_enabled_passthrough) {
+                // Apply filtering for cursor position (ABS_X and ABS_Y)
+                if (event.code == ABS_X || event.code == ABS_Y) {
+                    int *last_pos = (event.code == ABS_X) ? &last_abs_x : &last_abs_y;
+                    int *prev_delta = (event.code == ABS_X) ? &prev_delta_x : &prev_delta_y;
+
+                    if (*last_pos != -1) {
+                        int delta = event.value - *last_pos;
+                        int abs_delta = (delta < 0) ? -delta : delta;
+
+                        // Suppress jitter: ignore very small movements
+                        if (abs_delta < JITTER_THRESHOLD) {
+                            debug_printf("Filtering jitter: delta=%d\n", delta);
+                            break;  // Don't emit, don't update position
+                        }
+
+                        // Suppress lift noise: detect sudden large jumps
+                        int prev_abs_delta = (*prev_delta < 0) ? -*prev_delta : *prev_delta;
+                        if (abs_delta > JUMP_THRESHOLD && prev_abs_delta < JUMP_THRESHOLD) {
+                            debug_printf("Filtering jump: delta=%d (prev=%d)\n", delta, *prev_delta);
+                            break;  // Don't emit, don't update position
+                        }
+
+                        *prev_delta = delta;
+                    }
+
+                    *last_pos = event.value;
+                }
+
                 emit(output, event.type, event.code, event.value);
             }
             break;
