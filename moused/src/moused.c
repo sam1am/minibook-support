@@ -48,6 +48,28 @@ double smoothed_y = -1.0;
 #define SMOOTHING_MODERATE 0.6  // Moderate smoothing factor (40% old, 60% new)
 #define SMOOTHING_LIGHT 0.85    // Light smoothing factor (15% old, 85% new)
 
+// Multi-touch tracking for scrolling
+#define MAX_SLOTS 10
+typedef struct {
+    int tracking_id;  // -1 means slot is empty
+    int x;
+    int y;
+} touch_slot_t;
+
+touch_slot_t touch_slots[MAX_SLOTS] = {{-1, 0, 0}};
+int current_slot = 0;
+int active_fingers = 0;
+int prev_active_fingers = 0;  // Track previous state to detect transitions
+int stable_finger_count = 0;  // Debounced finger count
+int last_scroll_y = -1;
+double scroll_velocity = 0.0;
+
+// Scroll parameters
+#define SCROLL_THRESHOLD 3       // Minimum movement to trigger scroll (pixels)
+#define SCROLL_SCALE 3.0         // Scale factor for scroll sensitivity (higher = faster)
+#define INERTIA_DECAY 0.92       // Velocity decay factor per frame (higher = longer inertia)
+#define INERTIA_MIN_VELOCITY 0.5 // Stop when velocity drops below this
+
 // Recovery the device
 void recovery_device() {
     // Enable the pointer
@@ -80,6 +102,11 @@ int new_device() {
 
     // Clone the enabled event types and codes of the device
     clone_enabled_event_types_and_codes(input, fd);
+
+    // Enable scroll wheel events for two-finger scrolling
+    ioctl(fd, UI_SET_EVBIT, EV_REL);
+    ioctl(fd, UI_SET_RELBIT, REL_WHEEL);
+    ioctl(fd, UI_SET_RELBIT, REL_HWHEEL);
 
     // Set device properties to match physical trackpad (PROP=5)
     // This tells libinput it's a buttonpad-style touchpad, enabling proper gesture support
@@ -286,6 +313,18 @@ int main(int argc, char *argv[]) {
         switch (event.type) {
         case EV_SYN:
             debug_printf("EV_SYN: %d %d\n", event.code, event.value);
+
+            // Stabilize finger count at frame boundaries
+            if (event.code == SYN_REPORT) {
+                // If finger count changed, reset scroll position to avoid jumps
+                if (active_fingers != prev_active_fingers) {
+                    last_scroll_y = -1;
+                    debug_printf("Finger count changed: %d -> %d\n", prev_active_fingers, active_fingers);
+                    prev_active_fingers = active_fingers;
+                }
+                stable_finger_count = active_fingers;
+            }
+
             if (is_enabled_passthrough) {
                 emit(output, event.type, event.code, event.value);
             }
@@ -358,9 +397,99 @@ int main(int argc, char *argv[]) {
         case EV_ABS:
             debug_printf("EV_ABS: %d %d\n", event.code, event.value);
             if (is_enabled_passthrough) {
-                // Apply adaptive exponential smoothing for cursor position
-                if (event.code == ABS_X || event.code == ABS_Y ||
-                    event.code == ABS_MT_POSITION_X || event.code == ABS_MT_POSITION_Y) {
+                // Track multi-touch for two-finger scrolling
+                if (event.code == ABS_MT_SLOT) {
+                    current_slot = event.value;
+                    if (current_slot >= MAX_SLOTS) current_slot = MAX_SLOTS - 1;
+                    debug_printf("MT_SLOT: %d\n", current_slot);
+                } else if (event.code == ABS_MT_TRACKING_ID) {
+                    if (event.value == -1) {
+                        // Finger lifted
+                        if (touch_slots[current_slot].tracking_id != -1) {
+                            active_fingers--;
+                            debug_printf("Finger lifted. Active fingers: %d\n", active_fingers);
+                        }
+                        touch_slots[current_slot].tracking_id = -1;
+                        if (active_fingers == 0) {
+                            last_scroll_y = -1;  // Reset scroll tracking
+                        }
+                    } else {
+                        // New finger down
+                        if (touch_slots[current_slot].tracking_id == -1) {
+                            active_fingers++;
+                            debug_printf("Finger down. Active fingers: %d\n", active_fingers);
+                        }
+                        touch_slots[current_slot].tracking_id = event.value;
+                    }
+                } else if (event.code == ABS_MT_POSITION_X) {
+                    touch_slots[current_slot].x = event.value;
+                } else if (event.code == ABS_MT_POSITION_Y) {
+                    touch_slots[current_slot].y = event.value;
+
+                    // If we have 2 fingers (use stable count to avoid mid-frame transitions), calculate scroll
+                    if (stable_finger_count == 2) {
+                        // Calculate average Y position of all active fingers
+                        int sum_y = 0, count = 0;
+                        for (int i = 0; i < MAX_SLOTS; i++) {
+                            if (touch_slots[i].tracking_id != -1) {
+                                sum_y += touch_slots[i].y;
+                                count++;
+                            }
+                        }
+                        int avg_y = sum_y / count;
+
+                        if (last_scroll_y != -1) {
+                            int delta_y = avg_y - last_scroll_y;
+                            int abs_delta = delta_y < 0 ? -delta_y : delta_y;
+                            if (abs_delta > SCROLL_THRESHOLD) {
+                                // Generate scroll event (negative for natural scrolling)
+                                // Scale and round to get smooth scrolling
+                                double scroll_amount_float = -delta_y * SCROLL_SCALE / 10.0;
+                                int scroll_amount = scroll_amount_float >= 0
+                                    ? (int)(scroll_amount_float + 0.5)
+                                    : (int)(scroll_amount_float - 0.5);
+
+                                if (scroll_amount != 0) {
+                                    emit(output, EV_REL, REL_WHEEL, scroll_amount);
+                                    emit(output, EV_SYN, SYN_REPORT, 0);
+                                    debug_printf("Scroll: %d (delta_y=%d)\n", scroll_amount, delta_y);
+
+                                    // Track velocity for inertia
+                                    scroll_velocity = scroll_amount_float;
+                                }
+                            }
+                        }
+                        last_scroll_y = avg_y;
+
+                        // DON'T emit position events when scrolling - this prevents pinch zoom gestures
+                        break;
+                    }
+                }
+
+                // When scrolling (2+ fingers), suppress ALL multi-touch events to prevent gesture confusion
+                if (stable_finger_count >= 2) {
+                    // Only allow non-MT events through
+                    if (event.code != ABS_MT_SLOT &&
+                        event.code != ABS_MT_TRACKING_ID &&
+                        event.code != ABS_MT_POSITION_X &&
+                        event.code != ABS_MT_POSITION_Y &&
+                        event.code != ABS_MT_TOUCH_MAJOR &&
+                        event.code != ABS_MT_TOUCH_MINOR &&
+                        event.code != ABS_MT_PRESSURE) {
+                        emit(output, event.type, event.code, event.value);
+                    }
+                    break;
+                }
+
+                // Emit MT tracking events for single finger
+                if (event.code == ABS_MT_SLOT || event.code == ABS_MT_TRACKING_ID) {
+                    emit(output, event.type, event.code, event.value);
+                }
+
+                // Apply adaptive exponential smoothing for cursor position (single finger only)
+                if ((event.code == ABS_X || event.code == ABS_Y ||
+                    event.code == ABS_MT_POSITION_X || event.code == ABS_MT_POSITION_Y) &&
+                    stable_finger_count == 1) {
                     // Use appropriate smoothing variables based on event code
                     int is_x = (event.code == ABS_X || event.code == ABS_MT_POSITION_X);
                     double *smoothed = is_x ? &smoothed_x : &smoothed_y;
