@@ -36,8 +36,17 @@ int last_abs_x = -1;
 int last_abs_y = -1;
 int prev_delta_x = 0;
 int prev_delta_y = 0;
-#define JITTER_THRESHOLD 3      // Ignore movements smaller than this (pixels)
-#define JUMP_THRESHOLD 50       // Suppress jumps larger than this (likely lift noise)
+double smoothed_x = -1.0;
+double smoothed_y = -1.0;
+
+// Adaptive smoothing thresholds
+#define DEADZONE 2              // Ignore movements smaller than this (sub-pixel jitter)
+#define SMALL_MOVEMENT 10       // Movements below this get heavy smoothing
+#define MEDIUM_MOVEMENT 25      // Movements below this get moderate smoothing
+#define LIFT_NOISE_THRESHOLD 15 // Suppress sudden jumps larger than this (likely lift noise)
+#define SMOOTHING_HEAVY 0.3     // Heavy smoothing factor (70% old, 30% new)
+#define SMOOTHING_MODERATE 0.6  // Moderate smoothing factor (40% old, 60% new)
+#define SMOOTHING_LIGHT 0.85    // Light smoothing factor (15% old, 85% new)
 
 // Recovery the device
 void recovery_device() {
@@ -301,6 +310,8 @@ int main(int argc, char *argv[]) {
                         last_abs_y = -1;
                         prev_delta_x = 0;
                         prev_delta_y = 0;
+                        smoothed_x = -1.0;
+                        smoothed_y = -1.0;
                         debug_printf("Reset position tracking (finger lifted)\n");
                     }
                 }
@@ -347,35 +358,67 @@ int main(int argc, char *argv[]) {
         case EV_ABS:
             debug_printf("EV_ABS: %d %d\n", event.code, event.value);
             if (is_enabled_passthrough) {
-                // Apply filtering for cursor position (ABS_X and ABS_Y)
-                if (event.code == ABS_X || event.code == ABS_Y) {
-                    int *last_pos = (event.code == ABS_X) ? &last_abs_x : &last_abs_y;
-                    int *prev_delta = (event.code == ABS_X) ? &prev_delta_x : &prev_delta_y;
+                // Apply adaptive exponential smoothing for cursor position
+                if (event.code == ABS_X || event.code == ABS_Y ||
+                    event.code == ABS_MT_POSITION_X || event.code == ABS_MT_POSITION_Y) {
+                    // Use appropriate smoothing variables based on event code
+                    int is_x = (event.code == ABS_X || event.code == ABS_MT_POSITION_X);
+                    double *smoothed = is_x ? &smoothed_x : &smoothed_y;
+                    int *last_pos = is_x ? &last_abs_x : &last_abs_y;
 
-                    if (*last_pos != -1) {
-                        int delta = event.value - *last_pos;
-                        int abs_delta = (delta < 0) ? -delta : delta;
-
-                        // Suppress jitter: ignore very small movements
-                        if (abs_delta < JITTER_THRESHOLD) {
-                            debug_printf("Filtering jitter: delta=%d\n", delta);
-                            break;  // Don't emit, don't update position
-                        }
-
-                        // Suppress lift noise: detect sudden large jumps
-                        int prev_abs_delta = (*prev_delta < 0) ? -*prev_delta : *prev_delta;
-                        if (abs_delta > JUMP_THRESHOLD && prev_abs_delta < JUMP_THRESHOLD) {
-                            debug_printf("Filtering jump: delta=%d (prev=%d)\n", delta, *prev_delta);
-                            break;  // Don't emit, don't update position
-                        }
-
-                        *prev_delta = delta;
+                    // Initialize smoothed position on first touch
+                    if (*smoothed < 0.0) {
+                        *smoothed = (double)event.value;
+                        *last_pos = event.value;
+                        emit(output, event.type, event.code, event.value);
+                        break;
                     }
 
-                    *last_pos = event.value;
-                }
+                    // Calculate delta from raw position
+                    int delta = event.value - *last_pos;
+                    int abs_delta = (delta < 0) ? -delta : delta;
 
-                emit(output, event.type, event.code, event.value);
+                    // Get previous delta for jump detection
+                    int *prev_delta = is_x ? &prev_delta_x : &prev_delta_y;
+                    int prev_abs_delta = (*prev_delta < 0) ? -*prev_delta : *prev_delta;
+
+                    // Deadzone: ignore sub-pixel jitter when nearly still
+                    if (abs_delta < DEADZONE) {
+                        debug_printf("Deadzone: ignoring delta=%d\n", delta);
+                        break;  // Don't emit, don't update
+                    }
+
+                    // Lift noise detection: suppress sudden large jumps after small movements
+                    if (abs_delta > LIFT_NOISE_THRESHOLD && prev_abs_delta < SMALL_MOVEMENT) {
+                        debug_printf("Lift noise: suppressing jump delta=%d (prev=%d)\n", delta, *prev_delta);
+                        break;  // Don't emit, don't update
+                    }
+
+                    // Adaptive smoothing based on movement size
+                    double alpha;
+                    if (abs_delta < SMALL_MOVEMENT) {
+                        alpha = SMOOTHING_HEAVY;      // Heavy smoothing for small jittery movements
+                        debug_printf("Heavy smoothing: delta=%d\n", delta);
+                    } else if (abs_delta < MEDIUM_MOVEMENT) {
+                        alpha = SMOOTHING_MODERATE;   // Moderate smoothing for medium movements
+                        debug_printf("Moderate smoothing: delta=%d\n", delta);
+                    } else {
+                        alpha = SMOOTHING_LIGHT;      // Light smoothing for large intentional movements
+                        debug_printf("Light smoothing: delta=%d\n", delta);
+                    }
+
+                    // Apply exponential moving average: smoothed = alpha * new + (1-alpha) * old
+                    *smoothed = alpha * (double)event.value + (1.0 - alpha) * (*smoothed);
+
+                    // Emit the smoothed position
+                    int smoothed_value = (int)(*smoothed + 0.5);  // Round to nearest integer
+                    *last_pos = event.value;  // Track raw position for delta calculation
+                    *prev_delta = delta;      // Track for jump detection
+
+                    emit(output, event.type, event.code, smoothed_value);
+                } else {
+                    emit(output, event.type, event.code, event.value);
+                }
             }
             break;
         default:
